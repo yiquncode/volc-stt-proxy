@@ -4,25 +4,22 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// newTestServer wires a server to a fake upstream and a fake converter that
-// returns one second of silence (so tests don't need ffmpeg).
+// newTestServer wires a server to a fake upstream.
 func newTestServer(t *testing.T, upstream *httptest.Server, mutate func(*Config)) http.Handler {
 	t.Helper()
 	return newTestApp(t, upstream, mutate, io.Discard).routes()
@@ -37,14 +34,7 @@ func newTestApp(t *testing.T, upstream *httptest.Server, mutate func(*Config), l
 	if mutate != nil {
 		mutate(cfg)
 	}
-	s := newServer(cfg, slog.New(slog.NewTextHandler(logOut, nil)))
-	s.convert = func(ctx context.Context, path, ext string) ([]byte, error) {
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("temp upload missing: %v", err)
-		}
-		return testPCM(1), nil
-	}
-	return s
+	return newServer(cfg, slog.New(slog.NewTextHandler(logOut, nil)))
 }
 
 // multipartBody builds an OpenAI-style multipart request body.
@@ -67,7 +57,7 @@ func postTranscription(t *testing.T, h http.Handler, path string, fields map[str
 	t.Helper()
 	name := ""
 	if file != nil {
-		name = "audio.m4a"
+		name = "audio.wav"
 	}
 	return postNamed(t, h, path, fields, name, file, auth)
 }
@@ -88,7 +78,7 @@ func postNamed(t *testing.T, h http.Handler, path string, fields map[string]stri
 func TestTranscriptionFormats(t *testing.T) {
 	_, upstream := newFakeVolcWS(t, modeOK, " 你好世界 ")
 	h := newTestServer(t, upstream, nil)
-	audio := []byte("fake audio bytes")
+	audio := testWAV(1)
 
 	for _, path := range []string{"/v1/audio/transcriptions", "/audio/transcriptions"} {
 		rec := postTranscription(t, h, path, map[string]string{"model": "whisper-1", "language": "zh"}, audio, "Bearer anything")
@@ -118,7 +108,7 @@ func TestTranscriptionFormats(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &vj); err != nil || rec.Code != 200 {
 		t.Fatalf("verbose_json: %d %s", rec.Code, rec.Body)
 	}
-	if vj.Task != "transcribe" || vj.Language == nil || vj.Duration != 1 || vj.Text != "你好世界" || vj.Segments == nil {
+	if vj.Task != "transcribe" || vj.Language == nil || math.Abs(vj.Duration-1) > 0.01 || vj.Text != "你好世界" || vj.Segments == nil {
 		t.Errorf("verbose_json body = %s", rec.Body)
 	}
 
@@ -166,10 +156,9 @@ func TestTranscriptionBadInput(t *testing.T) {
 		t.Errorf("non-multipart: %d %s", rec.Code, rec.Body)
 	}
 
-	// MAX_UPLOAD_MB: a 1 MB cap rejects 1 MB + 1 byte of file (plus multipart framing).
-	small := newTestServer(t, nil, func(c *Config) { c.MaxUpload = 1 << 20 })
-	rec = postTranscription(t, small, "/v1/audio/transcriptions", nil, make([]byte, 1<<20+1), "")
-	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "1 MB limit") {
+	// MAX_UPLOAD_MB (default 24): a file just over the cap gets 413.
+	rec = postTranscription(t, h, "/v1/audio/transcriptions", nil, make([]byte, 24<<20+1), "")
+	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "24 MB limit") {
 		t.Errorf("too large: %d %s", rec.Code, rec.Body)
 	}
 }
@@ -186,7 +175,7 @@ func TestTranscriptionUpstreamErrors(t *testing.T) {
 	} {
 		_, upstream := newFakeVolcWS(t, tc.mode, "")
 		h := newTestServer(t, upstream, nil)
-		rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, []byte("x"), "")
+		rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, testWAV(1), "")
 		if rec.Code != tc.want {
 			t.Errorf("%s: status %d, want %d: %s", name, rec.Code, tc.want, rec.Body)
 		}
@@ -210,7 +199,7 @@ func TestProxyAPIKey(t *testing.T) {
 		"Bearer secret": 200,
 		"bearer secret": 200,
 	} {
-		rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, []byte("x"), auth)
+		rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, testWAV(1), auth)
 		if rec.Code != want {
 			t.Errorf("auth %q: status %d, want %d", auth, rec.Code, want)
 		}
@@ -256,109 +245,12 @@ func TestModelsAndHealth(t *testing.T) {
 	assertOpenAIError(t, rec)
 }
 
-// TestEndToEndWithFFmpeg runs a real m4a through ffmpeg and the handler.
-func TestEndToEndWithFFmpeg(t *testing.T) {
-	ffmpeg := requireFFmpeg(t)
-	src := filepath.Join(t.TempDir(), "in.m4a")
-	genAudio(t, ffmpeg, src, 1.5)
-	data, _ := os.ReadFile(src)
-
-	fake, upstream := newFakeVolcWS(t, modeOK, "hi")
-	cfg := testCfg(wsURL(upstream))
-	cfg.FFmpegPath = ffmpeg
-	h := newServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil))).routes()
-	rec := postTranscription(t, h, "/v1/audio/transcriptions", map[string]string{"response_format": "verbose_json"}, data, "")
-	var vj struct {
-		Duration float64 `json:"duration"`
-		Text     string  `json:"text"`
-	}
-	json.Unmarshal(rec.Body.Bytes(), &vj)
-	if rec.Code != 200 || vj.Text != "hi" || vj.Duration < 1.4 || vj.Duration > 1.6 {
-		t.Fatalf("got %d %s", rec.Code, rec.Body)
-	}
-	fake.mu.Lock()
-	if n := len(fake.audio); n < 1.4*bytesPerSecond || n > 1.6*bytesPerSecond || bytes.HasPrefix(fake.audio, []byte("RIFF")) {
-		t.Errorf("upstream got %d bytes of audio, want ~1.5 s of raw PCM", n)
-	}
-	fake.mu.Unlock()
-
-	// Garbage input should be rejected as a client error.
-	rec = postTranscription(t, h, "/v1/audio/transcriptions", nil, []byte("definitely not audio"), "")
-	if rec.Code != 400 {
-		t.Errorf("garbage audio: %d %s", rec.Code, rec.Body)
-	}
-}
-
-// TestPlaylistUploadRejected uploads an HLS playlist pointing at a local wav,
-// under several names; it must be rejected, never transcribed.
-func TestPlaylistUploadRejected(t *testing.T) {
-	ffmpeg := requireFFmpeg(t)
-	dir := t.TempDir()
-	secret := filepath.Join(dir, "secret.aac")
-	genAudio(t, ffmpeg, secret, 1)
-	pl := filepath.Join(dir, "evil.m3u8")
-	writePlaylist(t, pl, secret)
-	data, _ := os.ReadFile(pl)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("upstream must not be called for a playlist upload")
-	}))
-	defer upstream.Close()
-	cfg := testCfg(upstream.URL)
-	cfg.FFmpegPath = ffmpeg
-	h := newServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil))).routes()
-	for _, name := range []string{"evil.m3u8", "evil.wav", "evil", "evil.m4a"} {
-		rec := postNamed(t, h, "/v1/audio/transcriptions", nil, name, data, "")
-		if rec.Code != 400 {
-			t.Errorf("%s: status %d, want 400: %s", name, rec.Code, rec.Body)
-		}
-	}
-}
-
-// TestTempFileRemoved checks the upload is deleted after success and after
-// the client goes away mid-request.
-func TestTempFileRemoved(t *testing.T) {
-	_, upstream := newFakeVolcWS(t, modeOK, "x")
-	app := newTestApp(t, upstream, nil, io.Discard)
-	var seen string
-	app.convert = func(ctx context.Context, path, ext string) ([]byte, error) {
-		seen = path
-		return testPCM(1), nil
-	}
-	h := app.routes()
-	if rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, []byte("x"), ""); rec.Code != 200 {
-		t.Fatalf("status %d", rec.Code)
-	}
-	if _, err := os.Stat(seen); !os.IsNotExist(err) {
-		t.Errorf("temp file %s still exists after success", seen)
-	}
-
-	app.convert = func(ctx context.Context, path, ext string) ([]byte, error) {
-		seen = path
-		<-ctx.Done() // like ffmpeg being killed by exec.CommandContext
-		return nil, ctx.Err()
-	}
-	body, ct := multipartBody(t, nil, "a.wav", []byte("x"))
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", body).WithContext(ctx)
-	req.Header.Set("Content-Type", ct)
-	time.AfterFunc(50*time.Millisecond, cancel)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusGatewayTimeout {
-		t.Errorf("cancelled: status %d", rec.Code)
-	}
-	if _, err := os.Stat(seen); !os.IsNotExist(err) {
-		t.Errorf("temp file %s still exists after cancel", seen)
-	}
-}
-
 func TestConcurrencyLimitRespectsTimeout(t *testing.T) {
 	app := newTestApp(t, nil, func(c *Config) { c.Timeout = 100 * time.Millisecond }, io.Discard)
 	for range maxConcurrent {
 		app.sem <- struct{}{} // all workers busy
 	}
-	rec := postTranscription(t, app.routes(), "/v1/audio/transcriptions", nil, []byte("x"), "")
+	rec := postTranscription(t, app.routes(), "/v1/audio/transcriptions", nil, testWAV(1), "")
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Errorf("status %d, want 504", rec.Code)
 	}
@@ -369,39 +261,18 @@ func TestRequestLogLine(t *testing.T) {
 	var logBuf bytes.Buffer
 	h := newTestApp(t, upstream, nil, &logBuf).routes()
 	fields := map[string]string{"model": "whisper-1", "language": "zh", "response_format": "json"}
-	if rec := postNamed(t, h, "/v1/audio/transcriptions", fields, "Rec.M4A", []byte("abc"), ""); rec.Code != 200 {
+	if rec := postNamed(t, h, "/v1/audio/transcriptions", fields, "Rec.M4A", testWAV(1), ""); rec.Code != 200 {
 		t.Fatalf("status %d", rec.Code)
 	}
 	line := logBuf.String()
-	for _, want := range []string{"file_ext=m4a", "file_type=application/octet-stream", "in_bytes=3",
-		"model=whisper-1", "response_format=json", "has_language=true", "has_prompt=false", "audio_sec=1", "text_len=12"} {
+	for _, want := range []string{"file_ext=m4a", "file_type=application/octet-stream", "in_bytes=32044",
+		"model=whisper-1", "response_format=json", "has_language=true", "has_prompt=false", "audio_sec_est=1", "text_len=12"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line missing %q: %s", want, line)
 		}
 	}
 	if strings.Contains(line, "secret words") || strings.Contains(line, "zh") {
 		t.Errorf("log line leaks content: %s", line)
-	}
-}
-
-func requireFFmpeg(t *testing.T) string {
-	t.Helper()
-	p, err := resolveFFmpeg(os.Getenv("FFMPEG_PATH"))
-	if err != nil {
-		t.Skip("ffmpeg not found")
-	}
-	return p
-}
-
-// genAudio writes a 44.1 kHz stereo sine wave of the given length to dst
-// (container chosen by extension), with the moov atom at the end for m4a.
-func genAudio(t *testing.T, ffmpeg, dst string, seconds float64) {
-	t.Helper()
-	out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
-		"-ac", "2", "-t", strconv.FormatFloat(seconds, 'f', -1, 64), dst).CombinedOutput()
-	if err != nil {
-		t.Fatalf("generating %s: %v: %s", dst, err, out)
 	}
 }
 
@@ -434,16 +305,11 @@ func TestStalledUploadTimesOut(t *testing.T) {
 }
 
 // TestClientDisconnectClosesUpstream checks that when the client goes away
-// mid-recognition, the WebSocket to Volcengine is closed and the upload removed.
+// mid-recognition, the WebSocket to Volcengine is closed.
 func TestClientDisconnectClosesUpstream(t *testing.T) {
 	fake, upstream := newFakeVolcWS(t, modeStall, "")
 	app := newTestApp(t, upstream, nil, io.Discard)
-	var seen string
-	app.convert = func(ctx context.Context, path, ext string) ([]byte, error) {
-		seen = path
-		return testPCM(1), nil
-	}
-	body, ct := multipartBody(t, nil, "a.wav", []byte("x"))
+	body, ct := multipartBody(t, nil, "a.wav", testWAV(1))
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", body).WithContext(ctx)
 	req.Header.Set("Content-Type", ct)
@@ -463,47 +329,65 @@ func TestClientDisconnectClosesUpstream(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Error("upstream WebSocket still open after client disconnect")
 	}
-	if _, err := os.Stat(seen); !os.IsNotExist(err) {
-		t.Errorf("temp file %s still exists", seen)
+}
+
+// TestUploadForwardedAsIs: the uploaded file reaches Volcengine byte for
+// byte, declared as audio.format "wav".
+func TestUploadForwardedAsIs(t *testing.T) {
+	fake, upstream := newFakeVolcWS(t, modeOK, "x")
+	h := newTestServer(t, upstream, nil)
+	data := testWAV(1)
+	for i := 44; i < len(data); i++ {
+		data[i] = byte(i * 7) // non-trivial sample bytes
+	}
+	if rec := postNamed(t, h, "/v1/audio/transcriptions", nil, "a.m4a", data, ""); rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !bytes.Equal(fake.audio, data) || !fake.sawLast {
+		t.Errorf("upstream got %d bytes (last=%v), want the %d uploaded bytes unchanged", len(fake.audio), fake.sawLast, len(data))
+	}
+	if f := fake.request["audio"].(map[string]any)["format"]; f != "wav" {
+		t.Errorf("audio.format = %v, want wav", f)
 	}
 }
 
-func TestTruncationHeader(t *testing.T) {
-	_, upstream := newFakeVolcWS(t, modeOK, "x")
-	for seconds, want := range map[float64]string{1: "true", 0.5: ""} {
-		app := newTestApp(t, upstream, func(c *Config) { c.MaxAudioSec = 1 }, io.Discard)
-		app.convert = func(ctx context.Context, path, ext string) ([]byte, error) { return testPCM(seconds), nil }
-		rec := postTranscription(t, app.routes(), "/v1/audio/transcriptions", nil, []byte("x"), "")
-		if rec.Code != 200 || rec.Header().Get("X-Audio-Truncated") != want {
-			t.Errorf("%v s: status %d, X-Audio-Truncated=%q, want %q", seconds, rec.Code, rec.Header().Get("X-Audio-Truncated"), want)
-		}
-	}
+// testWAV returns a 16 kHz mono 16-bit WAV of silence.
+func testWAV(seconds float64) []byte {
+	n := uint32(seconds * bytesPerSecond)
+	le := binary.LittleEndian
+	h := []byte("RIFF")
+	h = le.AppendUint32(h, 36+n)
+	h = append(h, "WAVEfmt "...)
+	h = le.AppendUint32(h, 16)
+	h = le.AppendUint16(h, 1)
+	h = le.AppendUint16(h, 1)
+	h = le.AppendUint32(h, sampleRate)
+	h = le.AppendUint32(h, bytesPerSecond)
+	h = le.AppendUint16(h, 2)
+	h = le.AppendUint16(h, 16)
+	h = append(h, "data"...)
+	h = le.AppendUint32(h, n)
+	return append(h, make([]byte, n)...)
 }
 
-// TestLongDictation sends ~3 minutes of audio through ffmpeg and the handler
-// to the fake upstream. REQUEST_TIMEOUT is 1s and the fake delays its final
-// result by 1.5s, so this only passes if the upstream deadline grows with
-// the audio length (1s + 180s × 0.5).
+// TestLongDictation sends a 3-minute WAV through the handler to the fake
+// upstream. REQUEST_TIMEOUT is 1s and the fake delays its final result by
+// 1.5s, so this only passes if the upstream deadline grows with the size
+// estimate of the audio (1s + 180s × 0.5).
 func TestLongDictation(t *testing.T) {
-	ffmpeg := requireFFmpeg(t)
-	src := filepath.Join(t.TempDir(), "long.m4a")
-	genAudio(t, ffmpeg, src, 180)
-	data, _ := os.ReadFile(src)
-
 	fake, upstream := newFakeVolcWS(t, modeOK, "long")
 	fake.finalDelay = 1500 * time.Millisecond
-	cfg := testCfg(wsURL(upstream))
-	cfg.FFmpegPath = ffmpeg
-	cfg.Timeout = time.Second
-	h := newServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil))).routes()
+	h := newTestServer(t, upstream, func(c *Config) { c.Timeout = time.Second })
+	data := testWAV(180)
 	rec := postTranscription(t, h, "/v1/audio/transcriptions", nil, data, "")
-	if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != `{"text":"long"}` || rec.Header().Get("X-Audio-Truncated") != "" {
+	if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != `{"text":"long"}` {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	n := len(fake.audio)
-	if n < 179*bytesPerSecond || n > 181*bytesPerSecond || fake.packets != (n+audioChunkBytes-1)/audioChunkBytes || !fake.sawLast {
-		t.Errorf("upstream got %d bytes in %d packets (last=%v)", n, fake.packets, fake.sawLast)
+	if !bytes.Equal(fake.audio, data) || fake.packets != (len(data)+audioChunkBytes-1)/audioChunkBytes || !fake.sawLast {
+		t.Errorf("upstream got %d bytes in %d packets (last=%v)", len(fake.audio), fake.packets, fake.sawLast)
 	}
 }

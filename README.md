@@ -1,13 +1,17 @@
 # volc-stt-proxy
 
 一个本地 HTTP 代理：对外提供 OpenAI 语音转文字接口（`POST /v1/audio/transcriptions`），
-内部把音频用 ffmpeg 转成 16 kHz 单声道 PCM，通过 WebSocket 发给火山引擎「豆包流式语音识别模型 2.0」的
+把上传的 WAV 文件原样通过 WebSocket 发给火山引擎「豆包流式语音识别模型 2.0」的
 **一句话识别**模式（`wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream`），返回整句结果。
 用途是让 Spokenly 等只支持 OpenAI 接口的听写工具使用豆包语音识别。
 
 > 早期版本使用的「大模型录音文件极速版识别」（flash，`volc.bigasr.auc_turbo`）已不再支持。
 
-依赖：Go（唯一第三方库 `github.com/coder/websocket`），本机 ffmpeg（`brew install ffmpeg`）。
+依赖：Go（唯一第三方库 `github.com/coder/websocket`），不需要 ffmpeg。
+
+**音频格式**：上传内容不做转换，一律以 `audio.format: "wav"` 发给火山，应为 16 kHz、单声道、16-bit 的 WAV
+（Spokenly 发送的正是这种格式）。其他格式由火山返回错误（代理返回 502）。
+可用 macOS 自带的 `afconvert -f WAVE -d LEI16@16000 -c 1 in.aiff out.wav` 转换。
 
 ## 构建
 
@@ -33,7 +37,7 @@ go test ./...                      # 或 make test
 ## 配置
 
 复制 `.env.example` 为 `.env`（放在运行程序的工作目录下）并填写凭证。已存在的环境变量优先于 `.env`。
-未配置凭证或找不到 ffmpeg 时启动即报错退出。
+未配置凭证时启动即报错退出。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -45,11 +49,9 @@ go test ./...                      # 或 make test
 | `VOLC_LANGUAGE` | 空 | 指定语种，如 `zh-CN`、`en-US`，作为 `audio.language` 发送 |
 | `LISTEN_ADDR` | `127.0.0.1:8090` | |
 | `PROXY_API_KEY` | 空 | 设置后客户端须带 `Authorization: Bearer <值>` |
-| `FFMPEG_PATH` | 自动查找 | |
-| `REQUEST_TIMEOUT` | `60s` | 基础超时：读取上传、等待空闲 + 转码各自受此限制 |
-| `TIMEOUT_PER_AUDIO_SECOND` | `0.5` | 识别会话超时 = `REQUEST_TIMEOUT` + 音频秒数 × 此值（10 分钟音频为 6 分钟） |
-| `MAX_AUDIO_SECONDS` | `600` | 单次最长 10 分钟，超出部分截断 |
-| `MAX_UPLOAD_MB` | `128` | 请求体上限（10 分钟 48 kHz 立体声 WAV 约 115 MB）；上传流式写入临时文件，不占内存 |
+| `REQUEST_TIMEOUT` | `60s` | 基础超时：读取上传、等待空闲 worker 各自受此限制 |
+| `TIMEOUT_PER_AUDIO_SECOND` | `0.5` | 识别会话超时 = `REQUEST_TIMEOUT` + 估算音频秒数（文件字节数 / 32000）× 此值 |
+| `MAX_UPLOAD_MB` | `24` | 上传上限，约 12 分钟 16 kHz 单声道 WAV；超出返回 413 |
 
 **关于语言**：客户端传来的 OpenAI `language` 字段会被忽略（OpenAI 用 `zh`，火山用 `zh-CN` 等，代码不一致）。
 默认由模型自动识别（中文含多种方言、英语）；如需指定，设置 `VOLC_LANGUAGE`。
@@ -61,7 +63,7 @@ go test ./...                      # 或 make test
 ```
 
 默认监听 `127.0.0.1:8090`，日志输出到 stderr。每个请求一行：文件扩展名、Content-Type、大小、
-解码后时长、`model`、`response_format`、是否带 `language`/`prompt`（只记是否存在）、上游耗时、状态码、
+音频时长、`model`、`response_format`、是否带 `language`/`prompt`（只记是否存在）、上游耗时、状态码、
 火山 logid（握手响应头 `X-Tt-Logid`）、错误码、文本长度。不记录识别文本、音频、prompt/language 的内容和密钥。
 
 ## Spokenly 设置
@@ -76,8 +78,9 @@ go test ./...                      # 或 make test
 
 ```sh
 say -v Tingting -o /tmp/hello.aiff "你好世界"
+afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/hello.aiff /tmp/hello.wav
 curl -s http://127.0.0.1:8090/v1/audio/transcriptions \
-  -F file=@/tmp/hello.aiff -F model=volc-bigasr
+  -F file=@/tmp/hello.wav -F model=volc-bigasr
 # {"text":"你好世界。"}
 
 curl -s http://127.0.0.1:8090/v1/models
@@ -89,12 +92,7 @@ curl -s http://127.0.0.1:8090/health
 
 限制与安全：
 
-- 上传上限 `MAX_UPLOAD_MB`（默认 128 MB，超出返回 413）。
-- 音频超过 `MAX_AUDIO_SECONDS`（默认 600 秒）的部分会被截断：仍返回前 600 秒的识别结果，
-  并带响应头 `X-Audio-Truncated: true`，日志里记一条 WARN。
-- 支持的文件扩展名：wav、mp3、m4a/mp4/mov、aac、ogg/opus/oga、webm、flac、aif/aiff、caf。
-  扩展名缺失、未知或与内容不符时由 ffmpeg 自动识别，但只允许上述格式的解码器（`-format_whitelist`）
-  且只能读本地文件（`-protocol_whitelist file`），因此 m3u8/concat 等播放列表无法引用其他文件。
+- 上传上限 `MAX_UPLOAD_MB`（默认 24 MB，超出返回 413）。
 - 最多同时处理 4 个识别请求，其余排队（受 `REQUEST_TIMEOUT` 约束）。
 
 ## 接口一览

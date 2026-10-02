@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -19,8 +18,7 @@ const (
 	defaultModelName  = "bigmodel"
 	defaultListenAddr = "127.0.0.1:8090"
 	defaultTimeout    = "60s"
-	defaultMaxAudio   = "600"
-	defaultMaxUpload  = "128"
+	defaultMaxUpload  = "24"
 	defaultPerAudioS  = "0.5"
 )
 
@@ -36,9 +34,7 @@ type Config struct {
 	EnableDDC   bool   // VOLC_ENABLE_DDC: request.enable_ddc (语义顺滑)
 	ListenAddr  string
 	ProxyAPIKey string // optional bearer token required from clients
-	FFmpegPath  string
 	Timeout     time.Duration
-	MaxAudioSec int     // MAX_AUDIO_SECONDS: longer audio is truncated by ffmpeg
 	MaxUpload   int64   // MAX_UPLOAD_MB, in bytes
 	PerAudioSec float64 // TIMEOUT_PER_AUDIO_SECOND: extra upstream time per second of audio
 }
@@ -50,10 +46,10 @@ func (c *Config) upstreamTimeout(audioSec float64) time.Duration {
 }
 
 // maxRequestDuration bounds a whole request (used as the server's
-// WriteTimeout): upload (REQUEST_TIMEOUT) + conversion (REQUEST_TIMEOUT) +
+// WriteTimeout): upload (REQUEST_TIMEOUT) + worker wait (REQUEST_TIMEOUT) +
 // the longest possible upstream session + a margin.
 func (c *Config) maxRequestDuration() time.Duration {
-	return 2*c.Timeout + c.upstreamTimeout(float64(c.MaxAudioSec)) + 15*time.Second
+	return 2*c.Timeout + c.upstreamTimeout(float64(c.MaxUpload)/bytesPerSecond) + 15*time.Second
 }
 
 // useLegacyAuth reports whether the legacy App Key + Access Key pair is used.
@@ -86,7 +82,6 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		Language:    get("VOLC_LANGUAGE", ""),
 		ListenAddr:  get("LISTEN_ADDR", defaultListenAddr),
 		ProxyAPIKey: get("PROXY_API_KEY", ""),
-		FFmpegPath:  get("FFMPEG_PATH", ""),
 	}
 	if !c.useLegacyAuth() && c.APIKey == "" {
 		return nil, errors.New("no Volcengine credentials configured: set VOLC_API_KEY (new console), " +
@@ -97,11 +92,6 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("invalid REQUEST_TIMEOUT %q: want a positive duration like 60s", getenv("REQUEST_TIMEOUT"))
 	}
 	c.Timeout = d
-	n, err := strconv.Atoi(get("MAX_AUDIO_SECONDS", defaultMaxAudio))
-	if err != nil || n <= 0 {
-		return nil, fmt.Errorf("invalid MAX_AUDIO_SECONDS %q: want a positive integer", getenv("MAX_AUDIO_SECONDS"))
-	}
-	c.MaxAudioSec = n
 	mb, err := strconv.Atoi(get("MAX_UPLOAD_MB", defaultMaxUpload))
 	if err != nil || mb <= 0 {
 		return nil, fmt.Errorf("invalid MAX_UPLOAD_MB %q: want a positive integer", getenv("MAX_UPLOAD_MB"))
@@ -116,26 +106,6 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("invalid VOLC_ENABLE_DDC %q: want true or false", getenv("VOLC_ENABLE_DDC"))
 	}
 	return c, nil
-}
-
-// resolveFFmpeg returns a usable ffmpeg path. launchd jobs get a minimal PATH,
-// so common Homebrew locations are tried when PATH lookup fails.
-func resolveFFmpeg(explicit string) (string, error) {
-	if explicit != "" {
-		if _, err := exec.LookPath(explicit); err != nil {
-			return "", fmt.Errorf("FFMPEG_PATH %q is not an executable: %w", explicit, err)
-		}
-		return explicit, nil
-	}
-	if p, err := exec.LookPath("ffmpeg"); err == nil {
-		return p, nil
-	}
-	for _, p := range []string{"/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"} {
-		if _, err := exec.LookPath(p); err == nil {
-			return p, nil
-		}
-	}
-	return "", errors.New("ffmpeg not found: install it (brew install ffmpeg) or set FFMPEG_PATH")
 }
 
 // loadDotEnv reads KEY=VALUE pairs from path (if it exists) into the process

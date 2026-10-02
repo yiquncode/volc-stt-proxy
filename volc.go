@@ -42,7 +42,9 @@ const (
 	compressNone = 0b0000
 	compressGzip = 0b0001
 
-	audioChunkBytes = bytesPerSecond / 5 // 200 ms of 16 kHz mono s16le
+	sampleRate      = 16000
+	bytesPerSecond  = sampleRate * 2     // 16 kHz mono 16-bit
+	audioChunkBytes = bytesPerSecond / 5 // 200 ms of audio per packet
 	maxServerFrame  = 4 << 20
 
 	volcCodeEmptyAudio = 45000002 // "空音频": treated as no speech
@@ -105,7 +107,7 @@ type volcRequest struct {
 func (c *volcClient) buildRequest() volcRequest {
 	var r volcRequest
 	r.User.UID = "volc-stt-proxy"
-	r.Audio.Format = "pcm"
+	r.Audio.Format = "wav" // the upload is forwarded as-is; Volcengine parses the WAV
 	r.Audio.Codec = "raw"
 	r.Audio.Rate = sampleRate
 	r.Audio.Bits = 16
@@ -118,9 +120,9 @@ func (c *volcClient) buildRequest() volcRequest {
 	return r
 }
 
-// recognize runs one WebSocket session: full client request, PCM in 200 ms
-// audio-only packets (the last one flagged), then waits for the final result.
-func (c *volcClient) recognize(ctx context.Context, pcm []byte) (volcResult, error) {
+// recognize runs one WebSocket session: full client request, the WAV file in
+// 200 ms audio-only packets (the last one flagged), then waits for the final result.
+func (c *volcClient) recognize(ctx context.Context, audio []byte) (volcResult, error) {
 	var res volcResult
 	id := newUUID()
 	hdr := http.Header{}
@@ -185,7 +187,7 @@ func (c *volcClient) recognize(ctx context.Context, pcm []byte) (volcResult, err
 		done <- outcome{text, code, err}
 	}()
 
-	werr := sendSession(writeCtx, conn, payload, pcm)
+	werr := sendSession(writeCtx, conn, payload, audio)
 	var o outcome
 	if werr == nil || writeCtx.Err() != nil {
 		o = <-done // sent everything, or the reader finished first and cancelled the writes
@@ -216,20 +218,20 @@ func (c *volcClient) recognize(ctx context.Context, pcm []byte) (volcResult, err
 // sendSession writes the full client request and the audio packets.
 // Each 200 ms chunk is gzipped on its own with one reused encoder, so no
 // second full copy of the audio is ever built.
-func sendSession(ctx context.Context, conn *websocket.Conn, request, pcm []byte) error {
+func sendSession(ctx context.Context, conn *websocket.Conn, request, audio []byte) error {
 	var enc frameEncoder
 	if err := conn.Write(ctx, websocket.MessageBinary,
 		enc.encode(msgFullClientRequest, 0, serialJSON, request)); err != nil {
 		return err
 	}
 	for off := 0; ; off += audioChunkBytes {
-		end := min(off+audioChunkBytes, len(pcm))
+		end := min(off+audioChunkBytes, len(audio))
 		var flags byte
-		if end == len(pcm) {
+		if end == len(audio) {
 			flags = flagLastPacket
 		}
 		if err := conn.Write(ctx, websocket.MessageBinary,
-			enc.encode(msgAudioOnlyRequest, flags, serialNone, pcm[off:end])); err != nil {
+			enc.encode(msgAudioOnlyRequest, flags, serialNone, audio[off:end])); err != nil {
 			return err
 		}
 		if flags == flagLastPacket {

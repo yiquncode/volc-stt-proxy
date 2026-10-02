@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,29 +18,18 @@ import (
 	"unicode/utf8"
 )
 
-const maxConcurrent = 4 // simultaneous ffmpeg conversions + upstream calls
+const maxConcurrent = 4 // simultaneous upstream sessions
 
 type server struct {
 	cfg  *Config
 	volc *volcClient
 	log  *slog.Logger
-	sem  chan struct{}  // bounds concurrent conversions + upstream calls
+	sem  chan struct{}  // bounds concurrent upstream sessions
 	wg   sync.WaitGroup // in-flight transcriptions, for shutdown
-	// convert turns an uploaded audio file into raw 16 kHz mono s16le PCM.
-	// ext is the lowercase file extension without the dot ("" if none).
-	convert func(ctx context.Context, path, ext string) ([]byte, error)
 }
 
 func newServer(cfg *Config, logger *slog.Logger) *server {
-	return &server{
-		cfg:  cfg,
-		volc: newVolcClient(cfg),
-		log:  logger,
-		sem:  make(chan struct{}, maxConcurrent),
-		convert: func(ctx context.Context, path, ext string) ([]byte, error) {
-			return convertToPCM(ctx, cfg.FFmpegPath, path, ext, cfg.MaxAudioSec)
-		},
-	}
+	return &server{cfg: cfg, volc: newVolcClient(cfg), log: logger, sem: make(chan struct{}, maxConcurrent)}
 }
 
 func (s *server) routes() http.Handler {
@@ -123,7 +111,7 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 			"file_ext", u.ext, "file_type", u.contentType, "in_bytes", u.size,
 			"model", u.model, "response_format", u.responseFormat,
 			"has_language", u.hasLanguage, "has_prompt", u.hasPrompt,
-			"audio_sec", math.Round(lg.audioSec*100) / 100, "upstream_ms", lg.upstreamMS,
+			"audio_sec_est", math.Round(lg.audioSec*100) / 100, "upstream_ms", lg.upstreamMS,
 			"volc_code", lg.volcCode, "logid", lg.logID, "text_len", lg.textLen,
 			"total_ms", time.Since(start).Milliseconds(),
 		}
@@ -142,11 +130,10 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deadlines: the upload is bounded by the server's ReadTimeout
-	// (REQUEST_TIMEOUT); waiting for a worker plus ffmpeg get REQUEST_TIMEOUT;
+	// (REQUEST_TIMEOUT); waiting for a worker gets REQUEST_TIMEOUT;
 	// the Volcengine session gets REQUEST_TIMEOUT + audio × TIMEOUT_PER_AUDIO_SECOND.
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUpload)
-	up, err := readUpload(r) // streams the file part to a temp file
-	defer up.cleanup()
+	up, err := readUpload(r)
 	lg.up = up
 	if err != nil {
 		var tooBig *http.MaxBytesError
@@ -163,7 +150,7 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadRequest, "invalid_request_error", "invalid_request", err.Error())
 		return
 	}
-	if up.path == "" {
+	if !up.hasFile {
 		fail(http.StatusBadRequest, "invalid_request_error", "missing_file", "missing required 'file' field")
 		return
 	}
@@ -186,6 +173,9 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The WAV upload (Spokenly sends 16 kHz mono 16-bit) is forwarded as-is;
+	// its length estimates the audio duration for the session deadline.
+	lg.audioSec = float64(len(up.data)) / bytesPerSecond
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeout)
 	defer cancel()
 	select {
@@ -195,52 +185,25 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusGatewayTimeout, "server_error", "timeout", "timed out waiting for a free worker")
 		return
 	}
-
-	pcm, err := s.convert(ctx, up.path, up.ext)
+	uctx, ucancel := context.WithTimeout(r.Context(), s.cfg.upstreamTimeout(lg.audioSec))
+	defer ucancel()
+	t0 := time.Now()
+	res, err := s.volc.recognize(uctx, up.data)
+	lg.upstreamMS = time.Since(t0).Milliseconds()
+	lg.volcCode, lg.logID = res.Code, res.LogID
 	if err != nil {
-		if ctx.Err() != nil {
-			fail(http.StatusGatewayTimeout, "server_error", "timeout", "timed out converting audio")
-			return
+		var ue *upstreamError
+		if !errors.As(err, &ue) {
+			ue = &upstreamError{http.StatusBadGateway, err.Error()}
 		}
-		if errors.Is(err, errAudioTooLong) {
-			fail(http.StatusBadRequest, "invalid_request_error", "audio_too_long",
-				fmt.Sprintf("audio is longer than %d seconds", s.cfg.MaxAudioSec))
-			return
+		typ := "upstream_error"
+		if ue.status == http.StatusGatewayTimeout {
+			typ = "timeout"
 		}
-		lg.errMsg = err.Error() // full (trimmed) ffmpeg stderr goes to the log only
-		fail(http.StatusBadRequest, "invalid_request_error", "invalid_audio",
-			"could not decode audio file (unsupported or corrupt format)")
+		fail(ue.status, "server_error", typ, ue.msg)
 		return
 	}
-	lg.audioSec = pcmDuration(pcm)
-	if len(pcm) >= s.cfg.MaxAudioSec*bytesPerSecond { // ffmpeg -t cut it off
-		s.log.Warn("audio truncated", "route", r.URL.Path, "kept_sec", s.cfg.MaxAudioSec,
-			"in_bytes", up.size, "note", "original was at least this long; raise MAX_AUDIO_SECONDS to keep more")
-		w.Header().Set("X-Audio-Truncated", "true")
-	}
-
-	text := ""
-	if len(pcm) > 0 { // zero-length audio: nothing to recognize
-		uctx, ucancel := context.WithTimeout(r.Context(), s.cfg.upstreamTimeout(lg.audioSec))
-		defer ucancel()
-		t0 := time.Now()
-		res, err := s.volc.recognize(uctx, pcm)
-		lg.upstreamMS = time.Since(t0).Milliseconds()
-		lg.volcCode, lg.logID = res.Code, res.LogID
-		if err != nil {
-			var ue *upstreamError
-			if !errors.As(err, &ue) {
-				ue = &upstreamError{http.StatusBadGateway, err.Error()}
-			}
-			typ := "upstream_error"
-			if ue.status == http.StatusGatewayTimeout {
-				typ = "timeout"
-			}
-			fail(ue.status, "server_error", typ, ue.msg)
-			return
-		}
-		text = res.Text
-	}
+	text := res.Text
 	lg.textLen = utf8.RuneCountInString(text)
 	lg.status = http.StatusOK
 
@@ -261,9 +224,10 @@ func (s *server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// upload is the parsed multipart request; the audio is spooled to a temp file.
+// upload is the parsed multipart request.
 type upload struct {
-	path           string
+	data           []byte // the file part, read into memory under MAX_UPLOAD_MB
+	hasFile        bool
 	size           int64
 	ext            string // sanitized lowercase extension of the client's filename
 	contentType    string // Content-Type of the file part, for logging
@@ -273,15 +237,9 @@ type upload struct {
 	hasPrompt      bool
 }
 
-func (u *upload) cleanup() {
-	if u.path != "" {
-		os.Remove(u.path)
-	}
-}
-
-// readUpload streams the multipart body, writing the "file" part to a temp
-// file. It always returns a non-nil *upload so the caller can defer cleanup.
-// Fields model, language, prompt, temperature etc. are accepted and ignored
+// readUpload reads the multipart body; the "file" part is kept in memory (the
+// body is already capped by MaxBytesReader). It always returns a non-nil
+// *upload so its metadata can be logged. Fields model, language, prompt, temperature etc. are accepted and ignored
 // (model is kept for logging only).
 func readUpload(r *http.Request) (*upload, error) {
 	up := &upload{}
@@ -299,22 +257,14 @@ func readUpload(r *http.Request) (*upload, error) {
 		}
 		switch part.FormName() {
 		case "file":
-			if up.path != "" {
+			if up.hasFile {
 				break // ignore duplicate file parts
 			}
-			up.ext = uploadExt(part.FileName())
+			up.hasFile = true
+			up.ext = uploadExt(part.FileName()) // for logging only
 			up.contentType = truncate(part.Header.Get("Content-Type"), 64)
-			// No extension on the temp file, so ffmpeg never guesses a format from it.
-			f, err := os.CreateTemp("", "volc-stt-*")
-			if err != nil {
-				part.Close()
-				return up, fmt.Errorf("creating temp file: %w", err)
-			}
-			up.path = f.Name()
-			up.size, err = io.Copy(f, part)
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
+			up.data, err = io.ReadAll(part)
+			up.size = int64(len(up.data))
 			if err != nil {
 				part.Close()
 				return up, fmt.Errorf("reading file: %w", err)

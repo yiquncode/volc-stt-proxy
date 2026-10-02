@@ -330,8 +330,8 @@ func (f *fakeVolcWS) serve(w http.ResponseWriter, r *http.Request) {
 
 func testCfg(endpoint string) *Config {
 	return &Config{APIKey: "new-key", Endpoint: endpoint, ResourceID: defaultResourceID,
-		ModelName: "bigmodel", EnableDDC: true, Timeout: 5 * time.Second, MaxAudioSec: 600,
-		MaxUpload: 128 << 20, PerAudioSec: 0.5}
+		ModelName: "bigmodel", EnableDDC: true, Timeout: 5 * time.Second,
+		MaxUpload: 24 << 20, PerAudioSec: 0.5}
 }
 
 func testPCM(seconds float64) []byte {
@@ -372,7 +372,7 @@ func TestRecognizeSession(t *testing.T) {
 		}
 		req := fake.request
 		audio, _ := req["audio"].(map[string]any)
-		want := map[string]any{"format": "pcm", "codec": "raw", "rate": 16000.0, "bits": 16.0, "channel": 1.0, "language": "zh-CN"}
+		want := map[string]any{"format": "wav", "codec": "raw", "rate": 16000.0, "bits": 16.0, "channel": 1.0, "language": "zh-CN"}
 		for k, v := range want {
 			if audio[k] != v {
 				t.Errorf("audio.%s = %v, want %v", k, audio[k], v)

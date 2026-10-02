@@ -82,7 +82,7 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.useLegacyAuth() || cfg.ResourceID != "volc.seedasr.sauc.duration" ||
 		cfg.Endpoint != "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream" || !cfg.EnableDDC ||
 		cfg.ModelName != "bigmodel" || cfg.ListenAddr != "127.0.0.1:8090" || cfg.Timeout != 60*time.Second ||
-		cfg.MaxAudioSec != 600 || cfg.MaxUpload != 128<<20 || cfg.PerAudioSec != 0.5 {
+		cfg.MaxUpload != 24<<20 || cfg.PerAudioSec != 0.5 {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
 
@@ -104,8 +104,6 @@ func TestLoadConfig(t *testing.T) {
 		"only app key":     {"VOLC_APP_KEY": "app"},
 		"bad timeout":      {"VOLC_API_KEY": "k", "REQUEST_TIMEOUT": "soon"},
 		"negative timeout": {"VOLC_API_KEY": "k", "REQUEST_TIMEOUT": "-1s"},
-		"bad max audio":    {"VOLC_API_KEY": "k", "MAX_AUDIO_SECONDS": "ten"},
-		"zero max audio":   {"VOLC_API_KEY": "k", "MAX_AUDIO_SECONDS": "0"},
 		"bad ddc":          {"VOLC_API_KEY": "k", "VOLC_ENABLE_DDC": "maybe"},
 		"bad upload":       {"VOLC_API_KEY": "k", "MAX_UPLOAD_MB": "0"},
 		"bad per-second":   {"VOLC_API_KEY": "k", "TIMEOUT_PER_AUDIO_SECOND": "-1"},
@@ -130,8 +128,9 @@ func TestDerivedTimeouts(t *testing.T) {
 	if got := cfg.upstreamTimeout(5); got != 62500*time.Millisecond {
 		t.Errorf("upstreamTimeout(5) = %v, want 62.5s", got)
 	}
-	// upload (60) + conversion (60) + longest upstream session (360) + 15s margin
-	if got := cfg.maxRequestDuration(); got != 495*time.Second {
-		t.Errorf("maxRequestDuration = %v, want 8m15s", got)
+	// upload (60) + worker wait (60) + session for a 24 MiB upload
+	// (60 + 786.432 s × 0.5) + 15s margin
+	if got := cfg.maxRequestDuration(); got != 588216*time.Millisecond {
+		t.Errorf("maxRequestDuration = %v, want 9m48.216s", got)
 	}
 }

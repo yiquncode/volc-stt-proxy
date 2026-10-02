@@ -29,12 +29,9 @@ func main() {
 	if err != nil {
 		fatal("invalid configuration", err)
 	}
-	if cfg.FFmpegPath, err = resolveFFmpeg(cfg.FFmpegPath); err != nil {
-		fatal("invalid configuration", err)
-	}
 
 	// Request contexts derive from baseCtx, so cancelling it aborts in-flight
-	// work (ffmpeg is killed, temp files removed) if shutdown takes too long.
+	// work (upstream WebSockets are closed) if shutdown takes too long.
 	baseCtx, cancelRequests := context.WithCancel(context.Background())
 	defer cancelRequests()
 	app := newServer(cfg, logger)
@@ -74,8 +71,8 @@ func main() {
 	logger.Info("volc-stt-proxy listening",
 		"addr", cfg.ListenAddr, "endpoint", cfg.Endpoint, "resource_id", cfg.ResourceID,
 		"model_name", cfg.ModelName, "language", cfg.Language, "enable_ddc", cfg.EnableDDC, "auth", cfg.authMode(),
-		"proxy_auth", cfg.ProxyAPIKey != "", "ffmpeg", cfg.FFmpegPath, "timeout", cfg.Timeout,
-		"max_audio_sec", cfg.MaxAudioSec, "max_upload_mb", cfg.MaxUpload>>20,
+		"proxy_auth", cfg.ProxyAPIKey != "", "timeout", cfg.Timeout,
+		"max_upload_mb", cfg.MaxUpload>>20,
 		"timeout_per_audio_sec", cfg.PerAudioSec, "max_request", cfg.maxRequestDuration())
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		fatal("server error", err)
