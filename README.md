@@ -1,9 +1,9 @@
-# volc-stt-proxy
+# OpenAI-compatible transcription API for Doubao ASR
 
-让 Spokenly 等只支持 OpenAI 接口的听写工具用上火山引擎「豆包流式语音识别模型 2.0」。
+让 Spokenly 等听写工具用上豆包语音识别 2.0，填个地址就能用。
 
-这是一个本地 HTTP 代理：对外提供 OpenAI 语音转文字接口（`POST /v1/audio/transcriptions`），
-把上传的 WAV 原样通过 WebSocket 发给豆包的**一句话识别**模式，返回整句结果。
+本地运行的 Go 小程序：对外提供 OpenAI 语音转文字接口（`POST /v1/audio/transcriptions`），
+把上传的 WAV 原样通过 WebSocket 转给豆包的**一句话识别**模式，返回整句结果。
 
 依赖：Go（唯一第三方库 `github.com/coder/websocket`）。
 
